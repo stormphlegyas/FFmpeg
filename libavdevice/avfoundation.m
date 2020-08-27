@@ -128,6 +128,7 @@ typedef struct
     AVCaptureSession         *capture_session;
     AVCaptureVideoDataOutput *video_output;
     AVCaptureAudioDataOutput *audio_output;
+    intptr_t                  preview;
     CMSampleBufferRef         current_frame;
     CMSampleBufferRef         current_audio_frame;
 
@@ -977,6 +978,11 @@ static int avf_read_header(AVFormatContext *s)
     if (audio_device && add_audio_device(s, audio_device)) {
     }
 
+    if (ctx->preview) {
+        AVCaptureVideoPreviewLayer* prev = (__bridge AVCaptureVideoPreviewLayer*)ctx->preview;
+        prev.session = ctx->capture_session;
+    }
+    
     [ctx->capture_session startRunning];
 
     /* Unlock device configuration only after the session is started so it
@@ -1202,7 +1208,7 @@ static const AVOption options[] = {
     { "capture_mouse_clicks", "capture the screen mouse clicks", offsetof(AVFContext, capture_mouse_clicks), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, AV_OPT_FLAG_DECODING_PARAM },
     { "capture_raw_data", "capture the raw data from device connection", offsetof(AVFContext, capture_raw_data), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, AV_OPT_FLAG_DECODING_PARAM },
     { "drop_late_frames", "drop frames that are available later than expected", offsetof(AVFContext, drop_late_frames), AV_OPT_TYPE_BOOL, {.i64=1}, 0, 1, AV_OPT_FLAG_DECODING_PARAM },
-
+    { "preview", "pointer to preview of type UIView", offsetof(AVFContext, preview), AV_OPT_TYPE_INT64, {.i64 = 0}, 0, INT64_MAX, AV_OPT_FLAG_DECODING_PARAM },
     { NULL },
 };
 
