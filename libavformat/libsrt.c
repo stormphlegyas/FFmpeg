@@ -22,6 +22,8 @@
  */
 
 #include <srt/srt.h>
+#include <sys/syslog.h>
+#include <string.h>
 
 #include "libavutil/avassert.h"
 #include "libavutil/opt.h"
@@ -53,7 +55,6 @@ enum SRTMode {
 typedef struct SRTContext {
     const AVClass *class;
     int fd;
-    int listen_fd;
     int eid;
     int64_t rw_timeout;
     int64_t listen_timeout;
@@ -91,6 +92,10 @@ typedef struct SRTContext {
     int messageapi;
     SRT_TRANSTYPE transtype;
     int linger;
+    int auto_reconnect;
+    struct addrinfo* ai;
+    char hostname[1024];
+    char portstr[10];
 } SRTContext;
 
 #define D AV_OPT_FLAG_DECODING_PARAM
@@ -141,6 +146,7 @@ static const AVOption libsrt_options[] = {
     { "live",           NULL, 0, AV_OPT_TYPE_CONST,  { .i64 = SRTT_LIVE }, INT_MIN, INT_MAX, .flags = D|E, "transtype" },
     { "file",           NULL, 0, AV_OPT_TYPE_CONST,  { .i64 = SRTT_FILE }, INT_MIN, INT_MAX, .flags = D|E, "transtype" },
     { "linger",         "Number of seconds that the socket waits for unsent data when closing", OFFSET(linger),           AV_OPT_TYPE_INT,      { .i64 = -1 }, -1, INT_MAX,   .flags = D|E },
+    { "auto_reconnect",         "Enable auto reconnect mode", OFFSET(auto_reconnect),           AV_OPT_TYPE_BOOL,      { .i64 = -1 }, -1, 1,   .flags = D|E },
     { NULL }
 };
 
@@ -162,105 +168,6 @@ static int libsrt_socket_nonblock(int socket, int enable)
     if (ret < 0)
         return ret;
     return srt_setsockopt(socket, 0, SRTO_RCVSYN, &blocking, sizeof(blocking));
-}
-
-static int libsrt_network_wait_fd(URLContext *h, int eid, int fd, int write)
-{
-    int ret, len = 1, errlen = 1;
-    int modes = SRT_EPOLL_ERR | (write ? SRT_EPOLL_OUT : SRT_EPOLL_IN);
-    SRTSOCKET ready[1];
-    SRTSOCKET error[1];
-
-    if (srt_epoll_add_usock(eid, fd, &modes) < 0)
-        return libsrt_neterrno(h);
-    if (write) {
-        ret = srt_epoll_wait(eid, error, &errlen, ready, &len, POLLING_TIME, 0, 0, 0, 0);
-    } else {
-        ret = srt_epoll_wait(eid, ready, &len, error, &errlen, POLLING_TIME, 0, 0, 0, 0);
-    }
-    if (ret < 0) {
-        if (srt_getlasterror(NULL) == SRT_ETIMEOUT)
-            ret = AVERROR(EAGAIN);
-        else
-            ret = libsrt_neterrno(h);
-    } else {
-        ret = errlen ? AVERROR(EIO) : 0;
-    }
-    if (srt_epoll_remove_usock(eid, fd) < 0)
-        return libsrt_neterrno(h);
-    return ret;
-}
-
-/* TODO de-duplicate code from ff_network_wait_fd_timeout() */
-
-static int libsrt_network_wait_fd_timeout(URLContext *h, int eid, int fd, int write, int64_t timeout, AVIOInterruptCB *int_cb)
-{
-    int ret;
-    int64_t wait_start = 0;
-
-    while (1) {
-        if (ff_check_interrupt(int_cb))
-            return AVERROR_EXIT;
-        ret = libsrt_network_wait_fd(h, eid, fd, write);
-        if (ret != AVERROR(EAGAIN))
-            return ret;
-        if (timeout > 0) {
-            if (!wait_start)
-                wait_start = av_gettime_relative();
-            else if (av_gettime_relative() - wait_start > timeout)
-                return AVERROR(ETIMEDOUT);
-        }
-    }
-}
-
-static int libsrt_listen(int eid, int fd, const struct sockaddr *addr, socklen_t addrlen, URLContext *h, int64_t timeout)
-{
-    int ret;
-    int reuse = 1;
-    if (srt_setsockopt(fd, SOL_SOCKET, SRTO_REUSEADDR, &reuse, sizeof(reuse))) {
-        av_log(h, AV_LOG_WARNING, "setsockopt(SRTO_REUSEADDR) failed\n");
-    }
-    ret = srt_bind(fd, addr, addrlen);
-    if (ret)
-        return libsrt_neterrno(h);
-
-    ret = srt_listen(fd, 1);
-    if (ret)
-        return libsrt_neterrno(h);
-
-    ret = libsrt_network_wait_fd_timeout(h, eid, fd, 1, timeout, &h->interrupt_callback);
-    if (ret < 0)
-        return ret;
-
-    ret = srt_accept(fd, NULL, NULL);
-    if (ret < 0)
-        return libsrt_neterrno(h);
-    if (libsrt_socket_nonblock(ret, 1) < 0)
-        av_log(h, AV_LOG_DEBUG, "libsrt_socket_nonblock failed\n");
-
-    return ret;
-}
-
-static int libsrt_listen_connect(int eid, int fd, const struct sockaddr *addr, socklen_t addrlen, int64_t timeout, URLContext *h, int will_try_next)
-{
-    int ret;
-
-    ret = srt_connect(fd, addr, addrlen);
-    if (ret < 0)
-        return libsrt_neterrno(h);
-
-    ret = libsrt_network_wait_fd_timeout(h, eid, fd, 1, timeout, &h->interrupt_callback);
-    if (ret < 0) {
-        if (will_try_next) {
-            av_log(h, AV_LOG_WARNING,
-                   "Connection to %s failed (%s), trying next address\n",
-                   h->filename, av_err2str(ret));
-        } else {
-            av_log(h, AV_LOG_ERROR, "Connection to %s failed: %s\n",
-                   h->filename, av_err2str(ret));
-        }
-    }
-    return ret;
 }
 
 static int libsrt_setsockopt(URLContext *h, int fd, SRT_SOCKOPT optname, const char * optnamestr, const void * optval, int optlen)
@@ -359,11 +266,230 @@ static int libsrt_set_options_pre(URLContext *h, int fd)
     return 0;
 }
 
+static int libsrt_reconnect(URLContext *h, int flags) 
+{
+    
+    int ret, fd;
+    struct addrinfo hints = { 0 };
+    SRTContext *s = h->priv_data;
+    struct addrinfo *cur_ai;
+    int64_t open_timeout = 0;
+    if (s->rw_timeout >= 0) {
+        open_timeout = h->rw_timeout = s->rw_timeout;
+    }
+
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_DGRAM;
+    ret = getaddrinfo(s->hostname, s->portstr, &hints, &s->ai);
+    if (ret) {
+        av_log(h, AV_LOG_ERROR,
+               "Failed to resolve hostname %s: %s\n",
+               s->hostname, gai_strerror(ret));
+        return AVERROR(EIO);
+    }
+
+    cur_ai = s->ai;
+    
+    restart:    
+            
+    if (s->fd) {
+        srt_close(s->fd);
+    }
+        
+    fd = srt_create_socket();
+    if (fd < 0) {
+        ret = libsrt_neterrno(h);
+        goto fail;
+    }
+    s->fd = fd;
+
+
+    if ((ret = libsrt_set_options_pre(h, fd)) < 0) {
+        goto fail;
+    }
+
+    /* Set the socket's send or receive buffer sizes, if specified.
+       If unspecified or setting fails, system default is used. */
+    if (s->recv_buffer_size > 0) {
+        srt_setsockopt(fd, SOL_SOCKET, SRTO_UDP_RCVBUF, &s->recv_buffer_size, sizeof (s->recv_buffer_size));
+    }
+    if (s->send_buffer_size > 0) {
+        srt_setsockopt(fd, SOL_SOCKET, SRTO_UDP_SNDBUF, &s->send_buffer_size, sizeof (s->send_buffer_size));
+    }
+    if (libsrt_socket_nonblock(fd, 1) < 0)
+        av_log(h, AV_LOG_DEBUG, "libsrt_socket_nonblock failed\n");
+    
+    ret = srt_connect(fd, cur_ai->ai_addr, cur_ai->ai_addrlen);
+    if (ret < 0)
+        return libsrt_neterrno(h);
+    
+    return 0;
+    
+    fail:
+    if (cur_ai->ai_next) {
+        /* Retry with the next sockaddr */
+        cur_ai = cur_ai->ai_next;
+        if (fd >= 0)
+            srt_close(fd);
+        ret = 0;
+        goto restart;
+    }
+ fail1:
+    if (fd >= 0)
+        srt_close(fd);
+    //freeaddrinfo(ai);
+    return ret;
+}
+
+
+static int libsrt_network_wait_fd(URLContext *h, int eid, int fd, int write)
+{
+    int ret, len = 1, errlen = 1, slen = 1, serrlen = 1;
+    int modes = SRT_EPOLL_ERR | (write ? SRT_EPOLL_OUT : SRT_EPOLL_IN);
+    SRTSOCKET ready[1];
+    SRTSOCKET error[1];
+    SYSSOCKET sready[1];
+    SYSSOCKET serror[1];
+    
+    SRT_EPOLL_EVENT* epoll_events;
+    
+    SRTContext *s = h->priv_data;
+
+    printf("SRT state %d %d \n",srt_getsockstate(fd),fd);
+    
+    if (srt_epoll_add_usock(eid, fd, &modes) < 0){
+        return libsrt_neterrno(h);
+    }
+    if (write) {
+        ret = srt_epoll_wait(eid, error, &errlen, ready, &len, POLLING_TIME, serror, &serrlen, sready, &slen);
+    } else {
+        ret = srt_epoll_wait(eid, ready, &len, error, &errlen, POLLING_TIME, sready, &slen, serror, &serrlen);
+    }
+    if (ret < 0) {
+        if (write && s->auto_reconnect){
+            SRT_SOCKSTATUS state = srt_getsockstate(fd);
+            printf( "SRT get status fd %d (SRT status: %d)\n", fd, state);
+            switch (state) {
+                case SRTS_BROKEN:
+                case SRTS_NONEXIST:
+                case SRTS_CLOSED:
+                    printf("SRT socket broken, client will try to auto reconnect fd %d (SRT status: %d)\n", fd, state);
+                    srt_epoll_remove_usock(eid, fd);
+                    ret = libsrt_reconnect(h, h->flags);
+                    printf("Reconnect %d \n", ret);
+                    if (ret >= 0) {
+                        ret = AVERROR(EAGAIN);
+                        return ret;
+                    }
+            }
+        }
+        
+        if (srt_getlasterror(NULL) == SRT_ETIMEOUT)
+            ret = AVERROR(EAGAIN);
+        else
+            ret = libsrt_neterrno(h);
+    } else {
+        ret = errlen ? AVERROR(EIO) : 0;
+        if (write && s->auto_reconnect){
+            SRT_SOCKSTATUS state = srt_getsockstate(fd);
+            printf( "SRT get status fd %d (SRT status: %d)\n", fd, state);
+            switch (state) {
+                case SRTS_BROKEN:
+                case SRTS_NONEXIST:
+                case SRTS_CLOSED:
+                    printf("SRT socket broken, client will try to auto reconnect fd %d (SRT status: %d)\n", fd, state);
+                    srt_epoll_remove_usock(eid, fd);
+                    ret = libsrt_reconnect(h, h->flags);
+                    printf("Reconnect %d \n", ret);
+                    if (ret >= 0) {
+                        ret = AVERROR(EAGAIN);
+                        return ret;
+                    }
+            }
+        }
+    }
+    if (srt_epoll_remove_usock(eid, fd) < 0)
+        return libsrt_neterrno(h);
+    return ret;
+}
+
+/* TODO de-duplicate code from ff_network_wait_fd_timeout() */
+
+static int libsrt_network_wait_fd_timeout(URLContext *h, int eid, int fd, int write, int64_t timeout, AVIOInterruptCB *int_cb)
+{
+    int ret;
+    int64_t wait_start = 0;
+    SRTContext *s = h->priv_data;
+
+    while (1) {
+        if (ff_check_interrupt(int_cb))
+            return AVERROR_EXIT;
+        ret = libsrt_network_wait_fd(h, eid, s->fd, write);
+        if (ret != AVERROR(EAGAIN))
+            return ret;
+        if (timeout > 0) {
+            if (!wait_start)
+                wait_start = av_gettime_relative();
+            else if (av_gettime_relative() - wait_start > timeout)
+                return AVERROR(ETIMEDOUT);
+        }
+    }
+}
+
+static int libsrt_listen(int eid, int fd, const struct sockaddr *addr, socklen_t addrlen, URLContext *h, int64_t timeout)
+{
+    int ret;
+    int reuse = 1;
+    if (srt_setsockopt(fd, SOL_SOCKET, SRTO_REUSEADDR, &reuse, sizeof(reuse))) {
+        av_log(h, AV_LOG_WARNING, "setsockopt(SRTO_REUSEADDR) failed\n");
+    }
+    ret = srt_bind(fd, addr, addrlen);
+    if (ret)
+        return libsrt_neterrno(h);
+
+    ret = srt_listen(fd, 1);
+    if (ret)
+        return libsrt_neterrno(h);
+
+    ret = libsrt_network_wait_fd_timeout(h, eid, fd, 1, timeout, &h->interrupt_callback);
+    if (ret < 0)
+        return ret;
+
+    ret = srt_accept(fd, NULL, NULL);
+    if (ret < 0)
+        return libsrt_neterrno(h);
+    if (libsrt_socket_nonblock(ret, 1) < 0)
+        av_log(h, AV_LOG_DEBUG, "libsrt_socket_nonblock failed\n");
+
+    return ret;
+}
+
+static int libsrt_listen_connect(int eid, int fd, const struct sockaddr *addr, socklen_t addrlen, int64_t timeout, URLContext *h, int will_try_next)
+{
+    int ret;
+           
+    ret = srt_connect(fd, addr, addrlen);
+    if (ret < 0)
+        return libsrt_neterrno(h);
+
+    ret = libsrt_network_wait_fd_timeout(h, eid, fd, 1, timeout, &h->interrupt_callback);
+    if (ret < 0) {
+        if (will_try_next) {
+            av_log(h, AV_LOG_WARNING,
+                   "Connection to %s failed (%s), trying next address\n",
+                   h->filename, av_err2str(ret));
+        } else {
+            av_log(h, AV_LOG_ERROR, "Connection to %s failed: %s\n",
+                   h->filename, av_err2str(ret));
+        }
+    }
+    return ret;
+}
 
 static int libsrt_setup(URLContext *h, const char *uri, int flags)
 {
-    struct addrinfo hints = { 0 }, *ai, *cur_ai;
-    int port, fd = -1, listen_fd = -1;
+    struct addrinfo hints = { 0 }, *cur_ai;
+    int port, fd = -1;
     SRTContext *s = h->priv_data;
     const char *p;
     char buf[256];
@@ -403,7 +529,7 @@ static int libsrt_setup(URLContext *h, const char *uri, int flags)
     snprintf(portstr, sizeof(portstr), "%d", port);
     if (s->mode == SRT_MODE_LISTENER)
         hints.ai_flags |= AI_PASSIVE;
-    ret = getaddrinfo(hostname[0] ? hostname : NULL, portstr, &hints, &ai);
+    ret = getaddrinfo(hostname[0] ? hostname : NULL, portstr, &hints, &s->ai);
     if (ret) {
         av_log(h, AV_LOG_ERROR,
                "Failed to resolve hostname %s: %s\n",
@@ -411,15 +537,18 @@ static int libsrt_setup(URLContext *h, const char *uri, int flags)
         return AVERROR(EIO);
     }
 
-    cur_ai = ai;
+    cur_ai = s->ai;
+    strcpy(s->hostname, hostname);
+    strcpy(s->portstr, portstr);
 
  restart:
 
-    fd = srt_socket(cur_ai->ai_family, cur_ai->ai_socktype, 0);
+    fd = srt_create_socket();
     if (fd < 0) {
         ret = libsrt_neterrno(h);
         goto fail;
     }
+    s->fd = fd;
 
     if ((ret = libsrt_set_options_pre(h, fd)) < 0) {
         goto fail;
@@ -440,7 +569,6 @@ static int libsrt_setup(URLContext *h, const char *uri, int flags)
         // multi-client
         if ((ret = libsrt_listen(s->eid, fd, cur_ai->ai_addr, cur_ai->ai_addrlen, h, s->listen_timeout)) < 0)
             goto fail1;
-        listen_fd = fd;
         fd = ret;
     } else {
         if (s->mode == SRT_MODE_RENDEZVOUS) {
@@ -457,14 +585,14 @@ static int libsrt_setup(URLContext *h, const char *uri, int flags)
                 goto fail;
         }
     }
-    if ((ret = libsrt_set_options_post(h, fd)) < 0) {
+    if ((ret = libsrt_set_options_post(h, s->fd)) < 0) {
         goto fail;
     }
 
     if (flags & AVIO_FLAG_WRITE) {
         int packet_size = 0;
         int optlen = sizeof(packet_size);
-        ret = libsrt_getsockopt(h, fd, SRTO_PAYLOADSIZE, "SRTO_PAYLOADSIZE", &packet_size, &optlen);
+        ret = libsrt_getsockopt(h, s->fd, SRTO_PAYLOADSIZE, "SRTO_PAYLOADSIZE", &packet_size, &optlen);
         if (ret < 0)
             goto fail1;
         if (packet_size > 0)
@@ -472,10 +600,8 @@ static int libsrt_setup(URLContext *h, const char *uri, int flags)
     }
 
     h->is_streamed = 1;
-    s->fd = fd;
-    s->listen_fd = listen_fd;
 
-    freeaddrinfo(ai);
+    //freeaddrinfo(ai);
     return 0;
 
  fail:
@@ -484,17 +610,13 @@ static int libsrt_setup(URLContext *h, const char *uri, int flags)
         cur_ai = cur_ai->ai_next;
         if (fd >= 0)
             srt_close(fd);
-        if (listen_fd >= 0)
-            srt_close(listen_fd);
         ret = 0;
         goto restart;
     }
  fail1:
     if (fd >= 0)
         srt_close(fd);
-    if (listen_fd >= 0)
-        srt_close(listen_fd);
-    freeaddrinfo(ai);
+    //freeaddrinfo(ai);
     return ret;
 }
 
@@ -505,6 +627,8 @@ static int libsrt_open(URLContext *h, const char *uri, int flags)
     char buf[256];
     int ret = 0;
 
+    srt_setloglevel(LOG_DEBUG);
+    
     if (srt_startup() < 0) {
         return AVERROR_UNKNOWN;
     }
@@ -668,7 +792,6 @@ static int libsrt_write(URLContext *h, const uint8_t *buf, int size)
         if (ret)
             return ret;
     }
-
     ret = srt_sendmsg(s->fd, buf, size, -1, 0);
     if (ret < 0) {
         ret = libsrt_neterrno(h);
@@ -681,10 +804,11 @@ static int libsrt_close(URLContext *h)
 {
     SRTContext *s = h->priv_data;
 
+    if (s->ai) {
+        freeaddrinfo(s->ai);
+    }
+    
     srt_close(s->fd);
-
-    if (s->listen_fd >= 0)
-        srt_close(s->listen_fd);
 
     srt_epoll_release(s->eid);
 
