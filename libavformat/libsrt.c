@@ -354,8 +354,6 @@ static int libsrt_network_wait_fd(URLContext *h, int eid, int fd, int write)
     SRT_EPOLL_EVENT* epoll_events;
     
     SRTContext *s = h->priv_data;
-
-    printf("SRT state %d %d \n",srt_getsockstate(fd),fd);
     
     if (srt_epoll_add_usock(eid, fd, &modes) < 0){
         return libsrt_neterrno(h);
@@ -368,15 +366,12 @@ static int libsrt_network_wait_fd(URLContext *h, int eid, int fd, int write)
     if (ret < 0) {
         if (write && s->auto_reconnect){
             SRT_SOCKSTATUS state = srt_getsockstate(fd);
-            printf( "SRT get status fd %d (SRT status: %d)\n", fd, state);
             switch (state) {
                 case SRTS_BROKEN:
                 case SRTS_NONEXIST:
                 case SRTS_CLOSED:
-                    printf("SRT socket broken, client will try to auto reconnect fd %d (SRT status: %d)\n", fd, state);
                     srt_epoll_remove_usock(eid, fd);
                     ret = libsrt_reconnect(h, h->flags);
-                    printf("Reconnect %d \n", ret);
                     if (ret >= 0) {
                         ret = AVERROR(EAGAIN);
                         return ret;
@@ -392,15 +387,12 @@ static int libsrt_network_wait_fd(URLContext *h, int eid, int fd, int write)
         ret = errlen ? AVERROR(EIO) : 0;
         if (write && s->auto_reconnect){
             SRT_SOCKSTATUS state = srt_getsockstate(fd);
-            printf( "SRT get status fd %d (SRT status: %d)\n", fd, state);
             switch (state) {
                 case SRTS_BROKEN:
                 case SRTS_NONEXIST:
                 case SRTS_CLOSED:
-                    printf("SRT socket broken, client will try to auto reconnect fd %d (SRT status: %d)\n", fd, state);
                     srt_epoll_remove_usock(eid, fd);
                     ret = libsrt_reconnect(h, h->flags);
-                    printf("Reconnect %d \n", ret);
                     if (ret >= 0) {
                         ret = AVERROR(EAGAIN);
                         return ret;
